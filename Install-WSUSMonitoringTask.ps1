@@ -3,16 +3,38 @@
 <#
 .SYNOPSIS
     Creates a Scheduled Task to monitor the Windows Update Service
+    
 .DESCRIPTION
     This script creates a Windows Scheduled Task that runs the Monitor-WSUSService.ps1 
     script every 15 minutes to monitor the WSUS Service.
+
 .PARAMETER ScriptPath
     Path to the source Test-WSUSService.ps1 script. Default is the current directory.
+
 .PARAMETER TargetPath
     Target directory where the script will be copied. Default is c:\admin\scripts.
+
+.PARAMETER Force
+    Automatically replace existing task without prompting.
+
+.PARAMETER NoTest
+    Skip the test execution of the task after creation.
+
+.PARAMETER TaskFolder
+    Folder in Task Scheduler where the task will be created. Default is root (\).
+
 .EXAMPLE
     .\Setup-WSUSMonitoringTask.ps1
+
+.EXAMPLE
     .\Setup-WSUSMonitoringTask.ps1 -TargetPath "C:\Scripts"
+
+.EXAMPLE
+    .\Setup-WSUSMonitoringTask.ps1 -Force -NoTest
+
+.EXAMPLE
+    .\Setup-WSUSMonitoringTask.ps1 -TaskFolder "\MyTasks"
+
 .NOTES
     Author: Andreas Zogg
     Date: 02.12.2025
@@ -22,14 +44,32 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$false)]
-    [string]$ScriptPath = "$PSScriptRoot\Test-WSUSService.ps1",
+    [string]$TargetPath = "c:\admin\scripts",
     
     [Parameter(Mandatory=$false)]
-    [string]$TargetPath = "c:\admin\scripts"
+    [switch]$Force,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$NoTest,
+    
+    [Parameter(Mandatory=$false)]
+    [string]$TaskFolder = "\"
 )
 
 try {
+
+    #region declaration
+        $CurrentFile  = $MyInvocation.MyCommand
+        $CurrentPath  = (Split-Path -Path $MyInvocation.MyCommand.Path)
+        $RootPath     = ( ( Get-Item $CurrentPath ).Parent ).FullName
+        $FunctionPath = Join-Path -Path $CurrentPath -ChildPath 'Functions'
+
+        $Results = @()
+    #endregion declaration
+
+
     # Check if the source monitoring script exists
+    $ScriptPath = Join-Path -Path $CurrentPath -ChildPath "Test-WSUSService.ps1"
     if (-not (Test-Path $ScriptPath)) {
         throw "The Test-WSUSService.ps1 script was not found: $ScriptPath"
     }
@@ -54,35 +94,60 @@ try {
     $TaskName = "WSUS-Service-Monitor"
     $TaskDescription = "Monitors the Windows Update Service every 15 minutes and restarts it if necessary"
     
+    # Ensure TaskFolder starts with backslash and doesn't end with one (unless root)
+    if (-not $TaskFolder.StartsWith("\")) {
+        $TaskFolder = "\" + $TaskFolder
+    }
+    if ($TaskFolder -ne "\" -and $TaskFolder.EndsWith("\")) {
+        $TaskFolder = $TaskFolder.TrimEnd("\")
+    }
+    
+    # Full task path
+    $TaskPath = if ($TaskFolder -eq "\") { $TaskName } else { "$TaskFolder\$TaskName" }
+    
     # Check if task already exists
-    $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $ExistingTask = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction SilentlyContinue
     if ($ExistingTask) {
         Write-Host "Scheduled Task '$TaskName' already exists." -ForegroundColor Yellow
-        $Response = Read-Host "Do you want to replace it? (y/n)"
-        if ($Response -notmatch '^[yYjJ]') {
-            Write-Host "Cancelled." -ForegroundColor Yellow
+        if (-not $Force) {
+            Write-Host "Use -Force parameter to automatically replace existing task." -ForegroundColor Yellow
             return
         }
         
         # Delete existing task
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Unregister-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -Confirm:$false
         Write-Host "Existing task has been removed." -ForegroundColor Yellow
+    }
+    
+    # Create task folder if it doesn't exist (and it's not root)
+    if ($TaskFolder -ne "\" -and -not (Get-ScheduledTask -TaskPath $TaskFolder -ErrorAction SilentlyContinue)) {
+        try {
+            $Schedule = New-Object -ComObject Schedule.Service
+            $Schedule.Connect()
+            $RootFolder = $Schedule.GetFolder("\")
+            $RootFolder.CreateFolder($TaskFolder)
+            Write-Host "Created task folder: $TaskFolder" -ForegroundColor Green
+        } catch {
+            # Folder might already exist, continue
+        }
     }
     
     # Task Action - PowerShell execution (using copied script)
     $Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`""
     
     # Task Trigger - Every 15 minutes
-    $Trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Minutes 15) -RepetitionDuration ([TimeSpan]::MaxValue) -At (Get-Date) -Once
-    
+    # Task Trigger - Every 15 minutes (indefinitely)
+    $Trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Minutes 15) -At (Get-Date) -Once
+    $Trigger.Repetition.Duration = ""
+
     # Task Settings
     $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable:$false -DontStopOnIdleEnd
     
     # Task Principal - Run as SYSTEM
     $Principal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
     
-    # Register task
-    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description $TaskDescription
+    # Register task with folder path
+    Register-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description $TaskDescription
     
     Write-Host "`nScheduled Task '$TaskName' was created successfully!" -ForegroundColor Green
     Write-Host "The task runs every 15 minutes and monitors the Windows Update Service." -ForegroundColor Green
@@ -90,6 +155,7 @@ try {
     # Display task details
     Write-Host "`n=== Task Details ===" -ForegroundColor Cyan
     Write-Host "Name: $TaskName"
+    Write-Host "Task Path: $TaskPath"
     Write-Host "Description: $TaskDescription"
     Write-Host "Execution: Every 15 minutes"
     Write-Host "User: NT AUTHORITY\SYSTEM"
@@ -97,23 +163,30 @@ try {
     Write-Host "Target Directory: $TargetPath"
     
     # Test first execution
-    Write-Host "`n=== Test First Execution ===" -ForegroundColor Cyan
-    $TestResponse = Read-Host "Do you want to run the task once for testing? (y/n)"
-    if ($TestResponse -match '^[yYjJ]') {
-        Start-ScheduledTask -TaskName $TaskName
+    if (-not $NoTest) {
+        Write-Host "`n=== Test First Execution ===" -ForegroundColor Cyan
+        Write-Host "Running task once for testing..." -ForegroundColor Green
+        Start-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder
         Write-Host "Task has been started. Check the Event Log for results." -ForegroundColor Green
         
         # Wait briefly and show task status
         Start-Sleep -Seconds 3
-        $TaskInfo = Get-ScheduledTask -TaskName $TaskName | Get-ScheduledTaskInfo
-        Write-Host "Task Status: $($TaskInfo.LastTaskResult)" -ForegroundColor Yellow
-        Write-Host "Last Run: $($TaskInfo.LastRunTime)" -ForegroundColor Yellow
+        try {
+            $TaskInfo = Get-ScheduledTask -TaskName $TaskName -TaskPath $TaskFolder -ErrorAction Stop | Get-ScheduledTaskInfo
+            Write-Host "Task Status: $($TaskInfo.LastTaskResult)" -ForegroundColor Yellow
+            Write-Host "Last Run: $($TaskInfo.LastRunTime)" -ForegroundColor Yellow
+        } catch {
+            Write-Host "Could not retrieve task status immediately after creation. This is normal." -ForegroundColor Yellow
+            Write-Host "Use: Get-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskFolder' to check later." -ForegroundColor Yellow
+        }
+    } else {
+        Write-Host "`nTest execution skipped (NoTest parameter specified)." -ForegroundColor Yellow
     }
     
     Write-Host "`n=== Management ===" -ForegroundColor Cyan
-    Write-Host "Show task: Get-ScheduledTask -TaskName '$TaskName'"
-    Write-Host "Stop task: Stop-ScheduledTask -TaskName '$TaskName'"
-    Write-Host "Delete task: Unregister-ScheduledTask -TaskName '$TaskName'"
+    Write-Host "Show task: Get-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskFolder'"
+    Write-Host "Stop task: Stop-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskFolder'"
+    Write-Host "Delete task: Unregister-ScheduledTask -TaskName '$TaskName' -TaskPath '$TaskFolder'"
     Write-Host "Event Logs: Get-WinEvent -LogName Application | Where-Object {`$_.ProviderName -eq 'WSUS-Monitor'}"
     
 } catch {
