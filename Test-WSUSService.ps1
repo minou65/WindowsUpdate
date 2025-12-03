@@ -2,81 +2,168 @@
 
 <#
 .SYNOPSIS
-    Monitors the Windows Update Service (WSUS) and restarts it if necessary
+    Creates a Scheduled Task to monitor the Windows Update Service
 .DESCRIPTION
-    This script checks the status of the Windows Update Service and starts it
-    if it's not running. It logs all actions to the Windows Event Log.
+    This script creates a Windows Scheduled Task that runs the Monitor-WSUSService.ps1 
+    script every 15 minutes to monitor the WSUS Service.
+.PARAMETER ScriptPath
+    Path to the source Test-WSUSService.ps1 script. Default is the current directory.
+.PARAMETER TargetPath
+    Target directory where the script will be copied. Default is c:\admin\scripts.
+.PARAMETER Force
+    Automatically replace existing task without prompting.
+.PARAMETER NoTest
+    Skip the test execution of the task after creation.
+.EXAMPLE
+    .\Setup-WSUSMonitoringTask.ps1
+    .\Setup-WSUSMonitoringTask.ps1 -TargetPath "C:\Scripts"
+    .\Setup-WSUSMonitoringTask.ps1 -Force -NoTest
 .NOTES
     Author: Andreas Zogg
     Date: 02.12.2025
     Requires: Administrator privileges
 #>
 
-# Event Log Parameter
-$LogName = "Application"
-$Source = "WSUS-Monitor"
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory=$false)]
+    [string]$TargetPath = "c:\admin\scripts",
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$Force,
+    
+    [Parameter(Mandatory=$false)]
+    [switch]$NoTest
+)
 
 try {
-    # Check if Event Source exists, create it if not
-    if (-not [System.Diagnostics.EventLog]::SourceExists($Source)) {
-        New-EventLog -LogName $LogName -Source $Source -ErrorAction SilentlyContinue
+
+    #region declaration
+        $CurrentFile  = $MyInvocation.MyCommand
+        $CurrentPath  = (Split-Path -Path $MyInvocation.MyCommand.Path)
+        $RootPath     = ( ( Get-Item $CurrentPath ).Parent ).FullName
+        $FunctionPath = Join-Path -Path $CurrentPath -ChildPath 'Functions'
+
+        $Results = @()
+    #endregion declaration
+
+
+    # Check if the source monitoring script exists
+    $ScriptPath = Join-Path -Path $CurrentPath -ChildPath "Test-WSUSService.ps1"
+    if (-not (Test-Path $ScriptPath)) {
+        throw "The Test-WSUSService.ps1 script was not found: $ScriptPath"
     }
     
-    # Windows Update Service Name
-    $ServiceName = "wuauserv"
+    Write-Host "Source monitoring script: $ScriptPath" -ForegroundColor Green
     
-    # Query Service Status
-    $Service = Get-Service -Name $ServiceName -ErrorAction Stop
+    # Create target directory if it doesn't exist
+    if (-not (Test-Path $TargetPath)) {
+        Write-Host "Creating target directory: $TargetPath" -ForegroundColor Yellow
+        New-Item -ItemType Directory -Path $TargetPath -Force | Out-Null
+    }
     
-    Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - WSUS Service Status: $($Service.Status)"
+    # Copy script to target location
+    $TargetScriptPath = Join-Path $TargetPath "Test-WSUSService.ps1"
+    Copy-Item -Path $ScriptPath -Destination $TargetScriptPath -Force
+    Write-Host "Script copied to: $TargetScriptPath" -ForegroundColor Green
     
-    # Check Service Status
-    if ($Service.Status -ne "Running") {
-        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - WSUS Service is not active. Attempting to start..."
-        
-        # Event Log entry for Service start attempt
-        Write-EventLog -LogName $LogName -Source $Source -EventId 1001 -EntryType Warning -Message "Windows Update Service (wuauserv) was stopped and is being restarted."
-        
-        # Start Service
-        Start-Service -Name $ServiceName -ErrorAction Stop
-        
-        # Wait briefly and check again
-        Start-Sleep -Seconds 5
-        $ServiceAfterStart = Get-Service -Name $ServiceName
-        
-        if ($ServiceAfterStart.Status -eq "Running") {
-            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - WSUS Service started successfully."
-            Write-EventLog -LogName $LogName -Source $Source -EventId 1002 -EntryType Information -Message "Windows Update Service (wuauserv) was started successfully."
-        } else {
-            Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - Error: WSUS Service could not be started."
-            Write-EventLog -LogName $LogName -Source $Source -EventId 1003 -EntryType Error -Message "Windows Update Service (wuauserv) could not be started. Status: $($ServiceAfterStart.Status)"
+    # Use the copied script for the scheduled task
+    $ScriptPath = $TargetScriptPath
+    
+    # Task Parameters
+    $TaskName = "WSUS-Service-Monitor"
+    $TaskDescription = "Monitors the Windows Update Service every 15 minutes and restarts it if necessary"
+    
+    # Check if task already exists
+    $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($ExistingTask) {
+        Write-Host "Scheduled Task '$TaskName' already exists." -ForegroundColor Yellow
+        if (-not $Force) {
+            Write-Host "Use -Force parameter to automatically replace existing task." -ForegroundColor Yellow
+            return
         }
+        
+        # Delete existing task
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Host "Existing task has been removed." -ForegroundColor Yellow
+    }
+    
+    # Task Action - PowerShell execution (using copied script)
+    $Action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ScriptPath`""
+    
+    # Task Trigger - Every 15 minutes
+    # Task Trigger - Every 15 minutes (indefinitely)
+    $Trigger = New-ScheduledTaskTrigger -RepetitionInterval (New-TimeSpan -Minutes 15) -At (Get-Date) -Once
+    $Trigger.Repetition.Duration = ""
+
+    # Task Settings
+    $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable:$false -DontStopOnIdleEnd
+    
+    # Task Principal - Run as SYSTEM
+    $Principal = New-ScheduledTaskPrincipal -UserID "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    
+    # Register task
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description $TaskDescription
+    
+    Write-Host "`nScheduled Task '$TaskName' was created successfully!" -ForegroundColor Green
+    Write-Host "The task runs every 15 minutes and monitors the Windows Update Service." -ForegroundColor Green
+    
+    # Display task details
+    Write-Host "`n=== Task Details ===" -ForegroundColor Cyan
+    Write-Host "Name: $TaskName"
+    Write-Host "Description: $TaskDescription"
+    Write-Host "Execution: Every 15 minutes"
+    Write-Host "User: NT AUTHORITY\SYSTEM"
+    Write-Host "Script Location: $ScriptPath"
+    Write-Host "Target Directory: $TargetPath"
+    
+    # Test first execution
+    if (-not $NoTest) {
+        Write-Host "`n=== Test First Execution ===" -ForegroundColor Cyan
+        Write-Host "Running task once for testing..." -ForegroundColor Green
+        Start-ScheduledTask -TaskName $TaskName
+        Write-Host "Task has been started. Check the Event Log for results." -ForegroundColor Green
+        
+        # Wait briefly and show task status
+        Start-Sleep -Seconds 3
+        $TaskInfo = Get-ScheduledTask -TaskName $TaskName | Get-ScheduledTaskInfo
+        Write-Host "Task Status: $($TaskInfo.LastTaskResult)" -ForegroundColor Yellow
+        Write-Host "Last Run: $($TaskInfo.LastRunTime)" -ForegroundColor Yellow
     } else {
-        Write-Output "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - WSUS Service is already running."
-        # Only log on first run or after restart
-        $LastCheck = Get-ItemProperty -Path "HKLM:\SOFTWARE\WSUSMonitor" -Name "LastSuccessfulCheck" -ErrorAction SilentlyContinue
-        if (-not $LastCheck -or (Get-Date).AddMinutes(-30) -gt [DateTime]$LastCheck.LastSuccessfulCheck) {
-            Write-EventLog -LogName $LogName -Source $Source -EventId 1000 -EntryType Information -Message "Windows Update Service (wuauserv) is running normally."
-        }
+        Write-Host "`nTest execution skipped (NoTest parameter specified)." -ForegroundColor Yellow
     }
     
-    # Registry entry for last successful check
-    if (-not (Test-Path "HKLM:\SOFTWARE\WSUSMonitor")) {
-        New-Item -Path "HKLM:\SOFTWARE\WSUSMonitor" -Force | Out-Null
-    }
-    Set-ItemProperty -Path "HKLM:\SOFTWARE\WSUSMonitor" -Name "LastSuccessfulCheck" -Value (Get-Date).ToString()
+    Write-Host "`n=== Management ===" -ForegroundColor Cyan
+    Write-Host "Show task: Get-ScheduledTask -TaskName '$TaskName'"
+    Write-Host "Stop task: Stop-ScheduledTask -TaskName '$TaskName'"
+    Write-Host "Delete task: Unregister-ScheduledTask -TaskName '$TaskName'"
+    Write-Host "Event Logs: Get-WinEvent -LogName Application | Where-Object {`$_.ProviderName -eq 'WSUS-Monitor'}"
     
 } catch {
-    $ErrorMessage = "Error monitoring WSUS Service: $($_.Exception.Message)"
-    Write-Error $ErrorMessage
-    
-    try {
-        Write-EventLog -LogName $LogName -Source $Source -EventId 1004 -EntryType Error -Message $ErrorMessage
-    } catch {
-        # If Event Log also fails, write to a file
-        $LogFile = "$env:TEMP\WSUS-Monitor-Error.log"
-        "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $ErrorMessage" | Out-File -FilePath $LogFile -Append -Encoding UTF8
-    }
-    
+    Write-Error "Error creating the Scheduled Task: $($_.Exception.Message)"
     exit 1
 }
+
+# Helper function to display task logs
+function Show-WSUSMonitorLogs {
+    <#
+    .SYNOPSIS
+    Displays the Event Logs of the WSUS Monitor
+    #>
+    try {
+        $Events = Get-WinEvent -LogName Application -ErrorAction Stop | 
+                  Where-Object {$_.ProviderName -eq 'WSUS-Monitor'} | 
+                  Select-Object -First 20
+        
+        if ($Events) {
+            Write-Host "`n=== Last 20 WSUS Monitor Events ===" -ForegroundColor Cyan
+            $Events | Format-Table TimeCreated, Id, LevelDisplayName, Message -AutoSize
+        } else {
+            Write-Host "No WSUS Monitor Events found." -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "Error retrieving Event Logs: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+Write-Host "`nNote: Use 'Show-WSUSMonitorLogs' to display the monitor logs." -ForegroundColor Cyan
